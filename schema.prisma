@@ -1,0 +1,276 @@
+// LE SAGE OS V1 — Prisma schema
+// Covers BUILD 0 (Foundation/Auth/Org/Audit), BUILD 1 (Products/Inventory/IMEI),
+// BUILD 2 (CRM), BUILD 3 (Checkout/Sale/Payment/Warranty/Commission — Golden Sale).
+// Amounts: Decimal (never Float) for money. Currency: XAF. Timestamps: UTC (timestamptz).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- CORE / ORG (BUILD 0) ----------
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now())
+  locations Location[]
+  users     User[]
+}
+
+model Location {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  name           String       // e.g. "Boutique R38 — Mfoundi Mall"
+  createdAt      DateTime     @default(now())
+
+  users         User[]
+  customers     Customer[]
+  units         InventoryUnit[]
+  sales         Sale[]
+}
+
+enum RoleName {
+  DG
+  FINANCE_MANAGER
+  COMMERCIAL_MANAGER
+  STOCK_MANAGER
+  MARKETING_MANAGER
+  ADMIN_ASSISTANT
+  SELLER
+  SAV_AGENT
+  SYSTEM_ADMIN
+  AUDITOR
+}
+
+// Person != UserAccount != Position != Role (BR-015). Kept minimal for V1:
+// one User = one real account holder; role drives RBAC scope directly.
+model User {
+  id             String       @id @default(uuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id])
+  locationId     String?
+  location       Location?    @relation(fields: [locationId], references: [id])
+  fullName       String
+  email          String       @unique
+  passwordHash   String
+  role           RoleName
+  mfaEnabled     Boolean      @default(false)
+  active         Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+
+  salesAsSeller  Sale[]       @relation("SaleSeller")
+  auditEvents    AuditEvent[]
+}
+
+// Every sensitive/critical action is journaled (§60, BR-002, BR-010).
+model AuditEvent {
+  id            String   @id @default(uuid())
+  occurredAt    DateTime @default(now())
+  actorType     String   // USER | SYSTEM | AUTOMATION | AI_AGENT | INTEGRATION
+  actorId       String?
+  actor         User?    @relation(fields: [actorId], references: [id])
+  action        String   // e.g. SALE_COMPLETED, STOCK_ADJUSTED
+  aggregateType String   // e.g. Sale, InventoryUnit
+  aggregateId   String
+  correlationId String?
+  detail        Json?
+}
+
+// ---------- PRODUCTS / INVENTORY (BUILD 1) ----------
+
+model Brand {
+  id       String    @id @default(uuid())
+  name     String    @unique
+  products Product[]
+}
+
+model Product {
+  id       String    @id @default(uuid())
+  brandId  String
+  brand    Brand     @relation(fields: [brandId], references: [id])
+  name     String    // e.g. "iPhone 13"
+  variants Variant[]
+}
+
+model Variant {
+  id                 String          @id @default(uuid())
+  productId          String
+  product            Product         @relation(fields: [productId], references: [id])
+  sku                String          @unique
+  capacity           String?         // e.g. "128GB"
+  color              String?
+  condition          String          // Neuf | Reconditionné A/B/C
+  currentPrice       Decimal         @db.Decimal(14, 2)
+  minAllowedPrice    Decimal?        @db.Decimal(14, 2)
+  warrantyPolicyId   String?
+  warrantyPolicy     WarrantyPolicy? @relation(fields: [warrantyPolicyId], references: [id])
+  units              InventoryUnit[]
+}
+
+enum UnitStatus {
+  AVAILABLE
+  RESERVED
+  QC
+  BLOCKED
+  SOLD
+}
+
+// Serialized device. IMEI unique; quantity is implicitly 1 (one row = one unit).
+model InventoryUnit {
+  id             String        @id @default(uuid())
+  variantId      String
+  variant        Variant       @relation(fields: [variantId], references: [id])
+  locationId     String
+  location       Location      @relation(fields: [locationId], references: [id])
+  imei           String        @unique
+  costPrice      Decimal       @db.Decimal(14, 2)
+  status         UnitStatus    @default(QC)
+  supplierRef    String?
+  acquiredAt     DateTime?
+  // Optimistic-concurrency guard: bumped on every state change; the Golden Sale
+  // transaction re-checks status+version under a row lock before committing (BR-001).
+  version        Int           @default(0)
+  createdAt      DateTime      @default(now())
+
+  movements      InventoryMovement[]
+  saleLines      SaleLine[]
+  warranty       Warranty?
+}
+
+enum MovementType {
+  RECEIPT
+  RESERVATION
+  RELEASE
+  SALE
+  ADJUSTMENT
+  RETURN
+}
+
+// Stock never changes without a movement row (BR-005).
+model InventoryMovement {
+  id          String        @id @default(uuid())
+  unitId      String
+  unit        InventoryUnit @relation(fields: [unitId], references: [id])
+  type        MovementType
+  occurredAt  DateTime      @default(now())
+  reference   String?       // e.g. SALE-0001, PO-0002
+  note        String?
+}
+
+model WarrantyPolicy {
+  id           String    @id @default(uuid())
+  name         String
+  durationDays Int
+  termsVersion Int       @default(1)
+  variants     Variant[]
+}
+
+// ---------- CRM (BUILD 2) ----------
+
+model Customer {
+  id             String     @id @default(uuid())
+  locationId     String
+  location       Location   @relation(fields: [locationId], references: [id])
+  fullName       String
+  phoneNormalized String    @unique // E.164-ish normalized phone, used for dedup
+  whatsapp       String?
+  ownerUserId    String?
+  notes          String?
+  createdAt      DateTime   @default(now())
+
+  sales          Sale[]
+  warranties     Warranty[]
+}
+
+// ---------- SALES / GOLDEN SALE (BUILD 3) ----------
+
+enum SaleStatus {
+  DRAFT
+  COMPLETED
+  VOIDED
+  REVERSED
+}
+
+model Sale {
+  id            String      @id @default(uuid())
+  reference     String      @unique // SALE-0001 (atomic sequence — see lib/reference.ts)
+  locationId    String
+  location      Location    @relation(fields: [locationId], references: [id])
+  customerId    String
+  customer      Customer    @relation(fields: [customerId], references: [id])
+  sellerId      String
+  seller        User        @relation("SaleSeller", fields: [sellerId], references: [id])
+  status        SaleStatus  @default(DRAFT)
+  subtotal      Decimal     @db.Decimal(14, 2)
+  discountPct   Decimal     @db.Decimal(5, 2) @default(0)
+  total         Decimal     @db.Decimal(14, 2)
+  createdAt     DateTime    @default(now())
+  completedAt   DateTime?
+
+  lines         SaleLine[]
+  payments      Payment[]
+  receivable    Receivable?
+}
+
+model SaleLine {
+  id       String        @id @default(uuid())
+  saleId   String
+  sale     Sale          @relation(fields: [saleId], references: [id])
+  unitId   String
+  unit     InventoryUnit @relation(fields: [unitId], references: [id])
+  price    Decimal       @db.Decimal(14, 2)
+}
+
+enum PaymentMethod {
+  CASH
+  MOBILE_MONEY
+  BANK
+}
+
+model Payment {
+  id        String        @id @default(uuid())
+  saleId    String
+  sale      Sale          @relation(fields: [saleId], references: [id])
+  method    PaymentMethod
+  amount    Decimal       @db.Decimal(14, 2)
+  reference String?       // Mobile Money / bank tx ref — dedup guard
+  createdAt DateTime      @default(now())
+
+  @@unique([method, reference]) // idempotency guard against duplicate payment refs
+}
+
+enum ReceivableStatus {
+  DUE
+  OVERDUE
+  PARTIALLY_PAID
+  PAID
+  DISPUTED
+}
+
+model Receivable {
+  id            String           @id @default(uuid())
+  saleId        String           @unique
+  sale          Sale             @relation(fields: [saleId], references: [id])
+  initialAmount Decimal          @db.Decimal(14, 2)
+  paidAmount    Decimal          @db.Decimal(14, 2) @default(0)
+  dueDate       DateTime
+  status        ReceivableStatus @default(DUE)
+}
+
+model Warranty {
+  id             String        @id @default(uuid())
+  unitId         String        @unique
+  unit           InventoryUnit @relation(fields: [unitId], references: [id])
+  customerId     String
+  customer       Customer      @relation(fields: [customerId], references: [id])
+  policyId       String
+  policyTermsVersion Int       // pinned at issue time — future policy edits never rewrite it
+  startsAt       DateTime      @default(now())
+  expiresAt      DateTime
+}
